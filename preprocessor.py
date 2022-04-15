@@ -1,10 +1,10 @@
-import numpy as np
+import random
+import math
 import itertools
 import torch
-from torch.nn.utils.rnn import pad_sequence
 from poppler import load_from_file
-from dataclasses import dataclass, field
-from transformers import AutoTokenizer, AutoConfig
+from dataclasses import dataclass
+from transformers import AutoTokenizer
 from torch.utils.data import Dataset
 import pandas as pd
 import glob
@@ -13,6 +13,9 @@ import re
 
 
 class Preprocessor:
+    """
+    Class containing methods related to parsing of Nixon tapes PDFs.
+    """
     @staticmethod
     def parse_as_dialogue(text: str) -> [(str, str)]:
         """
@@ -78,6 +81,10 @@ class Preprocessor:
 
 @dataclass
 class ConversationData(Dataset):
+    """
+    Data class containing a bunch of tokenized conversations.
+    """
+
     # Set of named speakers involved in the conversation.
     speakers: {str}
     # A list of conversations, in which each conversation consists of a list of tuples, where each tuple gives the
@@ -113,16 +120,23 @@ class ConversationData(Dataset):
             else:
                 self.tokenized_convos = data['tokenized_convos'][:cutoff]
 
+        # For each PDF in input dir, parse, get lines by speaker, tokenize convos.
         elif input_dir is not None:
             self.speakers = set()
             self.conversations = []
             self.tokenized_convos = []
+            convos = []
             for pdf in glob.glob(f'{input_dir}/*.pdf'):
                 text = '\n'.join(Preprocessor.read_pdf(pdf))
                 conversation = Preprocessor.parse_as_dialogue(text)
+
+                ind = random.randint(0, len(conversation))
+                convos += conversation[ind:ind+2]
+
                 self.speakers |= set([speaker for (speaker, _) in conversation])
                 self.conversations.append(conversation)
                 self.contexts = self.generate_contexts()
+
                 # tokenized_convos *should* be 2d.
                 for _, row in self.contexts.iterrows():
                     self.tokenized_convos += self.generate_conv(row)
@@ -160,68 +174,86 @@ class ConversationData(Dataset):
         with open(output_path, 'w+') as outfile:
             json.dump(serialized_data, outfile)
 
+    def train_test_split(self, train=0.8, train_path="./training/training.json", test_path="./training/testing.json"):
+        """
+        Create training and testing datasets with given train-test split, save to files.
+        :param train: Percentage of data (from 0-1) to go to training.
+        :param train_path: Path of training data Json file.
+        :param test_path: Path of testing data Json file.
+        """
+        total_len = len(self.tokenized_convos)
+        test_start = math.floor(train * total_len)
+
+        train_data = {
+            'speakers': list(self.speakers),
+            'conversations': self.conversations,
+            'tokenized_convos': self.tokenized_convos[:test_start]
+        }
+
+        with open(train_path, 'w+') as outfile:
+            json.dump(train_data, outfile)
+
+        test_data = {
+            'speakers': list(self.speakers),
+            'conversations': self.conversations,
+            'tokenized_convos': self.tokenized_convos[test_start:]
+        }
+
+        with open(test_path, 'w+') as outfile:
+            json.dump(test_data, outfile)
+
     def generate_contexts(self) -> pd.DataFrame:
+        """
+        We want to train our model to predict a response based on the previous N lines of dialogue.
+        For every group of N=7 lines, append them to an array. Return as a pandas dataframe.
+        :return: A pandas dataframe containing all sets of 7 lines in the set of conversations in
+        training data.
+        """
         history_len = 7
         contexts = []
         lines = [[line for (_, line) in convo] for convo in self.conversations]
         for conversation in lines:
             contexts += list(itertools.chain([conversation[i:(i-1-history_len):-1]
-                                         for i in range(history_len, len(conversation))]))
+                                              for i in range(history_len, len(conversation))]))
 
         columns = ['response', 'context'] + [f'context/{i}' for i in range(history_len - 1)]
         print(f'Len is {len(contexts)}')
+
         # Contexts is 2d arr, as intended.
         df = pd.DataFrame.from_records(contexts, columns=columns)
         df.to_csv('train_df.csv')
         return df
 
     def generate_conv(self, row):
+        """
+        Generate a vector of tokens from a given context (consisting of 7 lines of dialogue) and response.
+        Speakers are delimited by end-of-speaker token.
+        :param row:
+        :return:
+        """
         # EOS token signals that a speaker has finished speaking. GPT uses this.
         conv = list(reversed([self.tokenizer.encode(word) + [self.tokenizer.eos_token_id] for word in row
                               if word is not None]))
         # returns 1d array.
         return list(itertools.chain(conv))
 
-    def save_to_csv(self):
-        arr = []
-        cols = [
-            "@id",
-            "userProfile.userID.$",
-            "sms_text",
-            "userProfile.country.$",
-            "userProfile.age.$",
-            "userProfile.gender.$",
-            "srcNumber.$",
-            "phoneModel.@manufactuer",
-            "phoneModel.@smartphone",
-            "userProfile.frequency.$",
-        ]
-        lines = 0
-        break_out = False
-        for convo in self.conversations:
-            for speaker, line in convo:
-                arr += [['', '', line, 'SG', '', '', '', '', '', '']]
-                lines += 1
-
-
-        df = pd.DataFrame.from_records(arr, columns=cols)
-        df.to_csv('train_df.csv')
-
-
-
     def __len__(self):
+        """
+        How many entries in tokenized convo?
+        :return:
+        """
         return len(self.tokenized_convos)
 
     def __getitem__(self, ind):
-        # You may need to pad data before this?
+        """
+        Return (unpadded) tokenized convo (consisting of 7 lines of dialogue and a response) at given index.
+        :param ind: Index of conversation to retrieve.
+        :return: A tensor consisting of the tokens at the requested index.
+        """
         return torch.tensor(self.tokenized_convos[ind], dtype=torch.long)
 
 
 if __name__ == "__main__":
-    data = pd.read_csv('train_df.csv')
-    print(len(data))
     data = ConversationData(input_dir="./training")
-    print(data.contexts.head())
-    print(len(data.contexts))
-    # data.save_to_csv()
-    # data.save_to_file('./training/training.json')
+    data.train_test_split()
+
